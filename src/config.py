@@ -2,7 +2,7 @@ from pathlib import Path
 
 FORECAST_HORIZON = 48
 SEASON = 24
-DEFAULT_MODEL = 'AutoTheta'
+DEFAULT_MODEL = 'SeasonalNaive'
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = PROJECT_ROOT / '__output__'

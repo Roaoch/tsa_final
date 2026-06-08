@@ -9,10 +9,20 @@ import numpy as np
 import pandas as pd
 from statsforecast import StatsForecast
 from statsforecast.models import AutoARIMA, AutoETS, AutoTheta, Naive, SeasonalNaive
+from neuralforecast.models import NHITS
+from sklearn.ensemble import RandomForestRegressor
+from mlforecast import MLForecast
+from neuralforecast import NeuralForecast
+from mlforecast.lag_transforms import ExpandingMean, RollingMean
+from mlforecast.target_transforms import Differences
+from typing import Any
 
 from .config import DEFAULT_MODEL, FORECAST_HORIZON, OUTPUT_DIR, SEASON
 from .data import load_train_test, to_forecast_frame
 from .metrics import evaluate
+
+ml_models = {'RandomForestRegressor'}
+dl_models = {'NHITS'}
 
 
 @dataclass
@@ -32,7 +42,7 @@ class SolarForecastPipeline:
     season_length: int = SEASON
     model_name: str = DEFAULT_MODEL
     artifact_dir: Path = field(default_factory=lambda: OUTPUT_DIR / 'pipeline')
-    sf: StatsForecast | None = field(default=None, init=False)
+    sf: Any | None = field(default=None, init=False)
 
     def _build_models(self) -> list:
         builders = {
@@ -41,6 +51,9 @@ class SolarForecastPipeline:
             'AutoARIMA': lambda: AutoARIMA(season_length=self.season_length),
             'SeasonalNaive': lambda: SeasonalNaive(season_length=self.season_length),
             'Naive': lambda: Naive(),
+            'NHITS': lambda: NHITS(h=24, input_size=72, max_steps=200),
+            'RandomForestRegressor': lambda: RandomForestRegressor(n_estimators=200, n_jobs=-1),
+
         }
         if self.model_name not in builders:
             raise ValueError(
@@ -50,19 +63,47 @@ class SolarForecastPipeline:
         return [builders[self.model_name]()]
 
     def fit(self, train: pd.DataFrame) -> SolarForecastPipeline:
-        self.sf = StatsForecast(
-            models=self._build_models(),
-            freq='h',
-            n_jobs=-1,
-        )
-        self.sf.fit(train[['unique_id', 'ds', 'y']])
+        if self.model_name in dl_models:
+            self.sf = NeuralForecast(models=self._build_models(), freq='h')
+        elif self.model_name in ml_models:
+            self.sf = MLForecast(
+                models=self._build_models(),
+                freq='h',
+                lags=[1, 2, 6, 12, 24],
+                lag_transforms={
+                    1: [ExpandingMean()],
+                    24: [RollingMean(window_size=3)],
+                },
+                date_features=['hour', 'dayofweek'],
+                target_transforms=[Differences([24])]
+            )
+        else:
+            self.sf = StatsForecast(
+                models=self._build_models(),
+                freq='h',
+                n_jobs=-1,
+            )
+        
+        if self.model_name in ml_models:
+            self.sf.fit(train[['unique_id', 'ds', 'y']], static_features=[])
+        else:
+            self.sf.fit(train[['unique_id', 'ds', 'y']])
+
         return self
 
-    def predict(self) -> pd.DataFrame:
+    def predict(self, df: pd.DataFrame | None = None) -> pd.DataFrame:
         if self.sf is None:
             raise RuntimeError('Pipeline is not fitted.')
+
         t0 = time.perf_counter()
-        fcst = self.sf.predict(h=self.horizon)
+
+        if self.model_name in dl_models:
+           fcst = self.sf.predict(h=self.horizon, futr_df=df) 
+        elif self.model_name in ml_models:
+            fcst = self.sf.predict(h=self.horizon, X_df=df)
+        else:
+            fcst = self.sf.predict(h=self.horizon)
+
         self._last_predict_seconds = time.perf_counter() - t0
         return fcst
 
@@ -81,7 +122,7 @@ class SolarForecastPipeline:
         self.fit(train)
         fit_seconds = time.perf_counter() - t0
 
-        forecasts = self.predict()
+        forecasts = self.predict(test)
         model_col = self.model_name
         if model_col not in forecasts.columns:
             model_col = forecasts.columns.difference(['unique_id', 'ds']).tolist()[0]
