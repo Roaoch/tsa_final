@@ -1,206 +1,260 @@
-# Анализ временных рядов — Solar Power Plant
+# Итоговый отчёт - Solar Power Plant (Time Series Analysis)
 
 Прогноз суммарной AC-мощности солнечных блоков (Plant 1 и Plant 2) на **48 часов** (2 суток).
 
-## Структура репозитория
+**Ноутбуки:** `0_preprocessing_eda.ipynb` → `1_stats_models.ipynb` → `2_dl_models.ipynb` → `3_pipeline.ipynb`  
+**Код пайплайна:** `src/pipeline.py`  
+**Тестовая выборка:** `__output__/test.parquet` (hold-out, последние 48 ч × 2 блока)  
+**Графики экспериментов:** `img/`
 
-
-| Файл / каталог                 | Содержание                                                                         |
-| ------------------------------ | ---------------------------------------------------------------------------------- |
-| `0_preprocessing_eda.ipynb`    | Подготовка данных, EDA, постановка задачи                                          |
-| `1_stats_models.ipynb`         | Статистические модели (`statsforecast`), backtest, остатки                         |
-| `2_dl_models.ipynb`            | ML (`mlforecast`), DL (`neuralforecast`), аномалии, backtest, остатки              |
-| `3_pipeline.ipynb`             | Пайплайн и тестирование производительности                                         |
-| `src/`                         | Переиспользуемый код (`data`, `metrics`, `anomaly`, `stats`, `pipeline`, `config`) |
-| `__output__/`                  | Подготовленные parquet и артефакты пайплайна                                       |
-| `__input__/Solar Power Plant/` | Исходные CSV (Kaggle)                                                              |
-
+---
 
 ## Описание временного ряда
 
-- **Источник:** [Kaggle — Solar Power Plant](https://www.kaggle.com/datasets/anikannal/solar-power-generation-data/data) (Plant 1 и Plant 2, Индия).
-- **Период:** 15.05.2020 — 17.06.2020 (~34 суток).
-- **Частота исходных данных:** 15 минут (инверторы + погодный датчик на блок).
-- **Целевой ряд:** суммарная `AC_POWER` по инверторам блока, агрегированная до **1 часа** (kW).
-- **Экзогенные признаки:** `IRRADIATION`, `AMBIENT_TEMPERATURE`, `MODULE_TEMPERATURE`.
-- **Серии:** `unique_id` = `1` (Plant 1), `2` (Plant 2) — global-модель на двух рядах.
+| Параметр | Значение |
+| --- | --- |
+| Источник | [Kaggle - Solar Power Plant](https://www.kaggle.com/datasets/anikannal/solar-power-generation-data/data) |
+| Период | 15.05.2020 - 17.06.2020 (~34 суток) |
+| Исходная частота | 15 мин → агрегация **1 ч** |
+| Целевой ряд | `AC_POWER` (kW), сумма по инверторам блока |
+| Экзогенные признаки | `IRRADIATION`, `AMBIENT_TEMPERATURE`, `MODULE_TEMPERATURE` |
+| Серии | `unique_id` = `1` (Plant 1), `2` (Plant 2) |
 
 ## Постановка задачи
 
-
-| Параметр     | Значение                                         |
-| ------------ | ------------------------------------------------ |
-| Горизонт     | 48 часов                                         |
-| Режим        | Offline batch                                    |
+| Параметр | Значение |
+| --- | --- |
+| Горизонт | 48 часов |
+| Режим | Offline batch |
 | Train / Test | все данные кроме последних 48 ч / последние 48 ч |
-| Метрики      | MAE, RMSE, MAPE, sMAPE                           |
-| Сезонность   | Суточная (period = 24)                           |
+| Метрики | MAE, RMSE, MAPE, sMAPE (+ вариант без нулевого таргета) |
+| Сезонность | Суточная (period = 24) |
 
+**Особенности:** ~46% часов с нулевой выработкой (ночь). MAPE/sMAPE на полном ряду завышены - дополнительно отчитываем метрики **`no_zeros`** (только дневные часы с выработкой > 0).
 
-Суточная сезонность доминирует: ночью мощность ≈ 0, днём — пик по инсоляции. ADF-тест показывает нестационарность исходного ряда; для ML используется сезонная разность `Differences([24])`, для stats — сезонные компоненты.
+---
 
-## EDA (кратко)
+## Задача 1. Подготовка данных и EDA
 
-- Пропуски после агрегации минимальны; часовой индекс регулярен.
-- `seasonal_decompose` / STL выявляют суточный сезонный паттерн.
-- ACF/PACF — значимые лаги 24, 48, …
-- Сильная связь `AC_POWER` ↔ `IRRADIATION`.
+**Материалы:** `0_preprocessing_eda.ipynb`, `src/data.py`  
+**Код генерирует:** `__output__/train.parquet`, `test.parquet`, `hourly.parquet`
 
-Подробные графики — в `0_preprocessing_eda.ipynb`.
+**Выполнено:**
+- Загрузка и объединение Generation + Weather для Plant 1 и Plant 2
+- Агрегация инверторов, resample 1 ч, интерполяция пропусков
+- Базовый анализ: типы, пропуски, диапазоны, описательная статистика
+- EDA: временной ряд, сезонная декомпозиция, ACF/PACF, ADF-тест, связь с инсоляцией
+- Постановка задачи и сохранение подготовленных данных
 
-## Аномалии (`2_dl_models.ipynb`)
+### Визуализация (задача 1)
 
+![Выработка Plant 1](img/plant1_data.png)
 
-| Метод            | Идея                                  | Параметры            | Plant 1 (train) |
-| ---------------- | ------------------------------------- | -------------------- | --------------- |
-| IQR              | Выбросы по квантилям                  | k = 1.5              | 0 точек         |
-| STL + Z-score    | Остатки после STL(period=24)          | |z| > 3              | 24 точки        |
-| Isolation Forest | Многомерные выбросы (power + weather) | contamination = 0.02 | 16 точек        |
+![Сезонная декомпозиция](img/sesonal_decompose.png)
 
+![Связи признаков](img/pair_hist.png)
 
-**Выбор:** STL + Z-score — основной интерпретируемый метод (trend / seasonal / remainder). IQR на часовых данных почти не срабатывает из-за естественного диапазона мощности. Isolation Forest дополняет анализ многомерными отклонениями (например, аномальное сочетание температуры и выработки).
+### Вывод по задаче 1
 
-## Методы прогнозирования и результаты
+1. Ряд **нестационарен**; выражена **суточная сезонность** (period=24); после lag=24 ряд ближе к стационарности.
+2. **~46%** наблюдений - нулевая выработка ночью; это критично для выбора метрик и трансформаций.
+3. Связь `AC_POWER` ↔ `IRRADIATION` **сильная** - погодные признаки обоснованы для ML/DL.
+4. Данные приведены к машино-читаемому виду (pandas, parquet), hold-out - **48 последних часов** для каждого блока (96 строк test).
+5. Горизонт **48 ч** и offline-режим соответствуют задаче краткосрочного планирования выработки на 2 суток.
 
-### Baseline (stats)
+---
 
+## Задача 2. Статистические модели (`statsforecast`)
 
-| Модель        | Hold-out RMSE | Комментарий      |
-| ------------- | ------------- | ---------------- |
-| Naive         | ~39952 (CV)   | Нижняя граница   |
-| SeasonalNaive | 10990         | Учитывает lag=24 |
+**Материалы:** `1_stats_models.ipynb`, `src/stats.py`
 
+**Сравнено ≥5 методов** (auto + manual + baseline):
 
-### Статистические (`statsforecast`) — ≥5
+| Модель | Режим | RMSE (all) | sMAPE (all) | RMSE (no zeros) | sMAPE (no zeros) | Backtest RMSE | Backtest sMAPE |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Naive | baseline | 32577 | 108.3 | 44264 | 200.0 | ~39952 | 108.3 |
+| SeasonalNaive | baseline | 10990 | **19.0** | 14932 | 35.0 | ~12266 | **15.4** |
+| AutoETS | auto | **8682** | 109.4 | 11704 | 32.8 | ~9933 | 107.7 |
+| AutoTheta | auto | 9048 | 106.7 | 12294 | 27.7 | **~9685** | 104.4 |
+| AutoARIMA | auto | 9852 | 43.9 | 13386 | 32.3 | ~11445 | 35.7 |
+| Theta | manual (mult.) | 9040 | 106.7 | 12283 | 27.7 | - | - |
+| ARIMA | manual | 25231 | 158.8 | 32480 | 123.9 | - | - |
 
+**Обоснование надёжности:**
+- Rolling **backtest** (`cross_validation`, h=24, 5 окон, step=24)
+- **Анализ остатков:** ACF, Q–Q, Ljung–Box (in-sample)
+- **Hold-out** 48 ч, метрики all / no_zeros
+- **Визуализация** прогнозов на test - см. ниже
 
-| Модель                | Режим    | Hold-out RMSE | Backtest RMSE (h=24, 5 окон) |
-| --------------------- | -------- | ------------- | ---------------------------- |
-| AutoETS               | auto     | **8704**      | ~9851                        |
-| AutoTheta             | auto     | 9049          | **~9696**                    |
-| AutoARIMA             | auto     | 9962          | ~11376                       |
-| ARIMA(2,1,2)          | manual   | 25526         | —                            |
-| Theta                 | manual   | см. notebook  | —                            |
-| Naive / SeasonalNaive | baseline | см. notebook  | см. notebook                 |
+### Визуализация (задача 2)
 
+![Naive и SeasonalNaive на hold-out](img/naive_models.png)
 
-**Выбор (stats):** rolling backtest (`cross_validation`, h=24, 5 окон, step=24) + анализ остатков (ACF, Q–Q, Ljung–Box) + hold-out 48 ч. Лучший backtest — **AutoTheta**; лучший hold-out — **AutoETS**. Обе модели стабильны и учитывают суточную сезонность.
+![AutoETS, AutoTheta, AutoARIMA на hold-out](img/auto_models.png)
 
-### ML (`mlforecast`) — 3
+![Theta и ARIMA (manual) на hold-out](img/manual_models.png)
 
+![Rolling backtest (stats)](img/backtest_stats.png)
 
-| Модель       | Features                                                              | Hold-out RMSE | Backtest RMSE |
-| ------------ | --------------------------------------------------------------------- | ------------- | ------------- |
-| Ridge        | lags 1,2,6,12,24 + expanding/rolling transforms + hour/dow + diff(24) | **~11201**    | —             |
-| RandomForest | те же                                                                 | см. notebook  | **~7284**     |
-| LightGBM     | те же                                                                 | ~12329        | ~11201        |
+![Анализ остатков AutoTheta](img/autothta_rda.png)
 
+### Вывод по задаче 2
 
-### DL (`neuralforecast`) — 3
+1. Все stats-модели **существенно лучше Naive**; SeasonalNaive - сильный baseline (sMAPE ≈ **19%** all, **15.4%** backtest).
+2. По **hold-out RMSE** лучший auto-метод - **AutoETS (8682)**; manual **Theta (mult.)** сопоставим (9040).
+3. По **rolling backtest** стабильнее всего **AutoTheta (RMSE ≈ 9685, sMAPE ≈ 104)**.
+4. **AutoARIMA** точнее manual ARIMA, но медленнее (~185 с fit vs ~2 с у ETS/Theta).
+5. **Остатки** аддитивных моделей асимметричны из-за ночных нулей; multiplicative Theta предпочтительнее для интерпретации.
+6. **Итоговый выбор среди stats:** AutoETS по hold-out RMSE, AutoTheta по backtest, SeasonalNaive как interpretable baseline.
 
+---
 
-| Модель | Параметры                    | Hold-out RMSE | Backtest RMSE (3 окна) |
-| ------ | ---------------------------- | ------------- | ---------------------- |
-| NHITS  | input_size=72, max_steps=200 | **~9964**     | ~14341                 |
-| NBEATS | input_size=72, max_steps=200 | см. notebook  | **~14341**             |
-| LSTM   | input_size=72, max_steps=200 | см. notebook  | см. notebook           |
+## Задача 3. ML, DL и аномалии
 
+**Материалы:** `2_dl_models.ipynb`, `src/anomaly.py`
 
-**Вывод по ML/DL:** на коротком ряде stats-модели сопоставимы или лучше при меньшем времени обучения. DL backtest существенно медленнее (минуты на 3 модели × 3 окна).
+### 3.1. Аномалии (3 метода)
 
-## Сводка по задаче 1 и 2
+| Метод | Параметры | Plant 1 (train) |
+| --- | --- | --- |
+| IQR | k = 1.5 | 0 |
+| STL + Z-score | period=24, \|z\| > 3 | 24 |
+| Isolation Forest | contamination=0.02 | 16 |
 
-### Метрики Holdout
+**Выбор:** STL + Z-score - основной интерпретируемый метод; Isolation Forest - многомерные отклонения (power + weather).
 
+![Обнаруженные аномалии](img/anomalies_plot.png)
 
-| Модель                | MAE             | RMSE            | MAPE          | sMAPE         |
-| --------------------- | --------------- | --------------- | ------------- | ------------- |
-| Naive                 | 19887.051661    | 32577.206719    | 54.166667     | 108.333333    |
-| SeasonalNaive         | 5860.657587     | 10989.593847    | **28.648802** | **18.980735** |
-| AutoETS               | 5267.594130     | **8682.154858** | 6.559906e+10  | 109.440486    |
-| AutoTheta             | **4910.524014** | 9048.034779     | 3.615114e+09  | 106.683412    |
-| AutoARIMA             | 5266.542884     | 9977.902462     | 3.505419e+09  | 108.172259    |
-| Theta                 | **4909.676034** | 9040.294569     | 4.269145e+09  | 106.656122    |
-| ARIMA                 | 17809.634531    | 25231.321133    | 3.636172e+11  | 158.762790    |
-| Ridge                 | 6577.214514     | 9493.734833     | 1.646395e+11  | 113.640661    |
-| RandomForestRegressor | 5618.764537     | 10850.931698    | 2.767376e+08  | 27.964519     |
-| LGBMRegressor         | 7105.143619     | 12329.116548    | 2.433502e+10  | 123.547698    |
-| NHITS                 | 5511.730470     | 9963.547774     | 8.406318e+09  | 109.009168    |
-| NBEATS                | 5998.559626     | 10578.470750    | 2.338523e+10  | 110.549494    |
-| LSTM                  | 5759.210564     | 10654.635847    | 4.771823e+09  | 111.536337    |
+### 3.2. ML (`mlforecast`) - 3 модели
 
+| Модель | RMSE (all) | sMAPE (all) | RMSE (no zeros) | sMAPE (no zeros) | Backtest RMSE | Backtest sMAPE |
+| --- | --- | --- | --- | --- | --- | --- |
+| RandomForestRegressor | **4273** | **5.6** | 5805 | **10.4** | ~10772 | 29.3 |
+| Ridge | 7612 | 107.2 | 10001 | 28.7 | ~10978 | 111.7 |
+| LGBMRegressor | 5327 | 99.9 | 7230 | 15.1 | ~10293 | 119.8 |
 
-### Метрики BackTest
+**Features:** lags 1,2,6,12,24 + expanding/rolling transforms + `IRRADIATION`, температуры + hour/dow.  
+**`Differences([24])` отключён** - на zero-heavy ряду ухудшает качество.
 
+![ML-модели на hold-out](img/ml_models.png)
 
-| Модель                | MAE             | RMSE            | MAPE             | sMAPE         |
-| --------------------- | --------------- | --------------- | ---------------- | ------------- |
-| Naive                 | 24679.086414    | 39952.069205    | 5.416667e+01     | 108.333333    |
-| SeasonalNaive         | 6459.464420     | 12265.540880    | **1.620261e+01** | **15.351766** |
-| AutoETS               | 6025.784335     | 9933.443803     | 4.913608e+10     | 107.740548    |
-| AutoTheta             | **5445.592868** | **9684.787313** | 1.618279e+09     | 104.425379    |
-| AutoARIMA             | 6265.857585     | 11444.148479    | 4.426235e+09     | 90.967992     |
-| Ridge                 | 6718.131700     | 10976.902477    | 7.168084e+10     | 111.706529    |
-| RandomForestRegressor | 5892.156946     | 10798.055135    | 6.433645e+08     | 27.170441     |
-| LGBMRegressor         | 7283.726402     | 11201.357321    | 6.501120e+10     | 121.032676    |
-| NHITS                 | 8050.538805     | 14340.596345    | 1.546744e+10     | 108.217378    |
-| NBEATS                | 7749.094983     | 13433.275298    | 2.869416e+10     | 111.993385    |
-| LSTM                  | 7612.045201     | 14461.880257    | 3.040199e+09     | 109.522762    |
+![ML rolling backtest](img/ml_backtest.png)
 
+![Остатки RandomForest](img/random_forest_rda.png)
 
-### Residual Analysis
+### 3.3. DL (`neuralforecast`) - 3 модели
 
-### Скорость работы
+| Модель | RMSE (all) | sMAPE (all) | RMSE (no zeros) | sMAPE (no zeros) | Backtest RMSE | Backtest sMAPE |
+| --- | --- | --- | --- | --- | --- | --- |
+| NHITS | 8997 | 108.9 | 12223 | 31.9 | ~12942 | 107.5 |
+| NBEATS | 10227 | 109.3 | 13888 | 32.5 | **~14159** | 112.2 |
+| LSTM | 9981 | 112.5 | 13548 | 38.5 | ~15297 | 110.1 |
 
+Параметры: `input_size=72`, `max_steps=200`, `h=48`.
 
-| Модель                | Время обучения (сек.) | Время прогноза 48ч (сек.) |
-| --------------------- | --------------------- | ------------------------- |
-| Naive                 | 2.048313              | 2.076779                  |
-| SeasonalNaive         | 2.069756              | 2.128679                  |
-| AutoETS               | 2.274260              | 2.060773                  |
-| AutoTheta             | 2.342471              | 2.069258                  |
-| AutoARIMA             | 191.095822            | 2.331850                  |
-| RandomForestRegressor | **0.416762**          | **1.829052**              |
-| NHITS (GPU)           | 5.783119              | **0.104281**              |
+![DL-модели на hold-out](img/dl_models.png)
 
+![DL rolling backtest](img/dl_backtest.png)
 
-## Пайплайн
+![Остатки NHITS](img/nhist_rda.png)
 
-Класс `SolarForecastPipeline` (`src/pipeline.py`):
+### Вывод по задаче 3
 
-1. `build_datasets()` — загрузка Plant 1+2, агрегация, split, сохранение parquet.
-2. `fit()` — обучение statsforecast (по умолчанию **AutoTheta**).
-3. `predict()` — прогноз на 48 ч для всех `unique_id`.
-4. Оценка на hold-out, сохранение артефактов:
-  - `__output__/pipeline/latest_forecast.parquet`
-  - `__output__/pipeline/latest_evaluation.parquet`
-  - `__output__/pipeline/metrics.json`
+1. **RandomForest** - лучший ML по hold-out: RMSE **4273**, sMAPE **5.6%** (all); с `no_zeros` - sMAPE **10.4%**.
+2. **Ridge** - лучший RMSE среди ML на полной выборке без тяжёлого обучения (7612), но sMAPE all ≈ 107%.
+3. **DL (NHITS)** - RMSE ≈ **8997** на hold-out; sMAPE all ≈ 109%, no_zeros ≈ **31.9%**; backtest хуже ML/stats.
+4. **`Differences([24])` исключён** - экспериментально ухудшал LGBM.
+5. Для **аномалий** STL+Z-score выделил 24 точки; IQR на часовых данных не сработал (0 точек).
+6. **Итог:** RandomForest - лучший баланс точности и скорости с погодными exog; DL - запасной вариант при большем объёме данных.
 
-Поддерживаемые модели: `Naive`, `SeasonalNaive`, `AutoTheta`, `AutoETS`, `AutoARIMA`.
+---
 
-Модель по умолчанию `SeasonalNaive`
+## Задача 4. Пайплайн и тестирование
 
-### Выводы
+**Материалы:** `3_pipeline.ipynb`, `src/pipeline.py`
+
+**Класс `SolarForecastPipeline`:**
+1. `build_datasets()` - загрузка, split, parquet
+2. `fit()` / `predict()` - stats / ML (с погодой через `to_ml_frame`) / DL
+3. Метрики `metrics` + `metrics_no_zeros` → `__output__/pipeline/metrics.json`
+
+**Модель по умолчанию:** `RandomForestRegressor` (`src/config.py`)
+
+**Поддерживаемые модели:** Naive, SeasonalNaive, AutoTheta, AutoETS, AutoARIMA, LGBMRegressor, RandomForestRegressor, Ridge, NHITS, NBEATS, LSTM
+
+### Benchmark (hold-out, `3_pipeline.ipynb`)
+
+| Модель | RMSE (all) | sMAPE (all) | RMSE (no zeros) | sMAPE (no zeros) | fit (s) |
+| --- | --- | --- | --- | --- | --- |
+| RandomForestRegressor | **4356** | **5.7** | 5919 | **10.5** | **0.3** |
+| AutoETS | 8682 | 109.4 | 11704 | 32.8 | 2.1 |
+| AutoTheta | 9048 | 106.7 | 12294 | 27.7 | 2.1 |
+| NHITS | 9129 | 108.5 | 12402 | 31.1 | 5.9 |
+| AutoARIMA | 9978 | 108.2 | 13557 | 30.5 | 185.0 |
+| SeasonalNaive | 10990 | 19.0 | 14932 | 35.0 | 2.0 |
+| Naive | 32577 | 108.3 | 44264 | 200.0 | 2.0 |
+
+### Вывод по задаче 4
+
+1. Пайплайн **воспроизводим**: `build_datasets()` + `SolarForecastPipeline().run()` сохраняет forecast, evaluation и metrics.
+2. **RandomForestRegressor** - default: RMSE **4356**, sMAPE **5.7%** (all), sMAPE **10.5%** (no zeros); fit **< 0.5 с**.
+3. **SeasonalNaive** - лучший sMAPE среди stats на полном ряду (**19%**), полезен как лёгкий baseline.
+4. **AutoETS / AutoTheta** - быстрые stats-альтернативы (~2 с) с RMSE 8682–9048.
+5. **NHITS** - RMSE 9129, но sMAPE ~108% (all) и fit ~6 с; ROI низкий на коротком ряде.
+6. Метрики в **двух вариантах** (all / no_zeros) встроены в пайплайн.
+
+---
+
+## Сводная таблица выбора методов
+
+| Семейство | Модель | RMSE (all) | sMAPE (all) | sMAPE (no zeros) | Комментарий |
+| --- | --- | --- | --- | --- | --- |
+| Baseline | SeasonalNaive | 10990 | **19.0** | 35.0 | Лучший sMAPE (all) среди stats |
+| Statistical | AutoETS | 8682 | 109.4 | 32.8 | Лучший RMSE среди stats (hold-out) |
+| Statistical | AutoTheta | 9048 | 106.7 | 27.7 | Лучший RMSE на backtest |
+| ML | RandomForestRegressor | **4356** | **5.7** | **10.5** | Default пайплайна |
+| ML | Ridge | 7612 | 107.2 | 28.7 | Линейный ML-baseline |
+| DL | NHITS | 8997 | 108.9 | 31.9 | Лучший DL на hold-out |
+| Anomaly | STL + Z-score | - | - | - | 24 точки, interpretable |
+
+---
+
+## Общее заключение
+
+**Набор данных:** почасовая выработка двух блоков солнечной станции (Индия, ~34 суток).  
+**Цель:** offline-прогноз AC-мощности на **48 часов** для краткосрочного планирования.
+
+**Численные результаты:**
+- Baseline SeasonalNaive: RMSE **10990**, sMAPE **19.0%** (all) / **35.0%** (no zeros)
+- Лучший statistical hold-out: AutoETS, RMSE **8682**, sMAPE **109.4%** / **32.8%**
+- Лучший statistical backtest: AutoTheta, RMSE **~9685**, sMAPE **~104%**
+- Лучший ML/DL в пайплайне: RandomForestRegressor, RMSE **4356**, sMAPE **5.7%** / **10.5%**
+- DL NHITS: RMSE **8997**, sMAPE **108.9%** (all), backtest RMSE ~12942
+
+**Итоговое решение:** пайплайн `SolarForecastPipeline` с **RandomForestRegressor** и погодными exog. Выбор обоснован сравнением ≥5 stats-, 3 ML- и 3 DL-моделей, rolling backtest, анализом остатков, визуализацией на test и benchmark по fit/predict.
+
+**Ограничения:** короткий ряд (~34 дня) и горизонт 48 ч ограничивают обобщение DL; ~46% нулей ночью требуют отчёта sMAPE в двух вариантах; stats-модели не используют погоду напрямую.
+
+**Соответствие [итоговому заданию](https://github.com/MVRonkin/TimeSeriesCourse/blob/main/Last/README.md):** задачи 1–4 выполнены с выводами, численными результатами, графиками (`img/`) и общим заключением.
+
+---
 
 ## Запуск
 
 ```bash
 uv sync
+uv run python -c "from src.data import build_datasets; build_datasets()"
+uv run jupyter notebook
 ```
 
-## Тестовая выборка
+## Структура репозитория
 
-
-| Файл                        | Описание                         |
-| --------------------------- | -------------------------------- |
-| `__output__/train.parquet`  | Train (все кроме последних 48 ч) |
-| `__output__/test.parquet`   | Hold-out (последние 48 ч)        |
-| `__output__/hourly.parquet` | Полный подготовленный ряд        |
-
-
-## Валидация и надёжность
-
-- **Backtest:** rolling CV (stats/ML/DL) — см. `1_stats_models.ipynb`, `2_dl_models.ipynb`.
-- **Остатки:** in-sample (stats, ML) и CV-остатки (DL); проверка автокорреляции и нормальности.
-- **Пайплайн:** benchmark нескольких stats-моделей + замер fit/predict latency.
-
+| Файл | Задача |
+| --- | --- |
+| `0_preprocessing_eda.ipynb` | Задача 1 - EDA |
+| `1_stats_models.ipynb` | Задача 2 - statsforecast |
+| `2_dl_models.ipynb` | Задача 3 - ML/DL, аномалии |
+| `3_pipeline.ipynb` | Задача 4 - пайплайн |
+| `src/` | Переиспользуемый код |
+| `img/` | Графики экспериментов |
+| `__output__/` | Parquet и артефакты |

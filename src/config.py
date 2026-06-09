@@ -2,7 +2,7 @@ from pathlib import Path
 
 FORECAST_HORIZON = 48
 SEASON = 24
-DEFAULT_MODEL = 'SeasonalNaive'
+DEFAULT_MODEL = 'RandomForestRegressor'
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = PROJECT_ROOT / '__output__'
@@ -16,3 +16,5 @@ PLANT2_WEATHER = INPUT_DIR / 'Plant_2_Weather_Sensor_Data.csv'
 TRAIN_PATH = OUTPUT_DIR / 'train.parquet'
 TEST_PATH = OUTPUT_DIR / 'test.parquet'
 HOURLY_PATH = OUTPUT_DIR / 'hourly.parquet'
+
+WEATHER_COLS = ['IRRADIATION', 'AMBIENT_TEMPERATURE', 'MODULE_TEMPERATURE']

@@ -11,6 +11,7 @@ from .config import (
     OUTPUT_DIR,
     TEST_PATH,
     TRAIN_PATH,
+    WEATHER_COLS,
 )
 
 
@@ -112,3 +113,11 @@ def to_forecast_frame(df: pd.DataFrame) -> pd.DataFrame:
         'ds': df.index,
         'y': df['AC_POWER'],
     })
+
+
+def to_ml_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Long format for mlforecast / neuralforecast with weather exogenous."""
+    frame = to_forecast_frame(df)
+    for col in WEATHER_COLS:
+        frame[col] = df[col].values
+    return frame
