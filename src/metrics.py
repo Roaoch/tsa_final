@@ -20,7 +20,13 @@ def smape(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-6) -> float:
     return float(np.mean(2 * np.abs(y_pred - y_true) / denom) * 100)
 
 
-def evaluate(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+def evaluate(y_true: np.ndarray, y_pred: np.ndarray, no_zeros=False) -> dict[str, float]:
+    if no_zeros:
+        mask = np.argwhere(y_true != 0).flatten()
+        y_true = y_true[mask]
+        y_pred = y_pred[mask]
+
+
     return {
         'MAE': mae(y_true, y_pred),
         'RMSE': rmse(y_true, y_pred),
